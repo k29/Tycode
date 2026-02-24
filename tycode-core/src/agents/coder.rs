@@ -33,6 +33,7 @@ const CORE_PROMPT: &str = r#"You are a Tycode sub-agent responsible for executin
 - You have access to a debugging agent. Any bug that is not immediately obvious should be delegated to the debugging agent.
 - Spawn the debugging agent with a detailed description of the bug and any steps or hints to reproduce it. The debug agent will attempt to root cause the bug and give back a detailed root cause"#;
 
+#[derive(Default)]
 pub struct CoderAgent;
 
 impl CoderAgent {

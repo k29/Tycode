@@ -257,7 +257,7 @@ impl SteeringDocuments {
             };
             let path = entry.path();
 
-            if !path.extension().map_or(false, |ext| ext == "md") {
+            if !path.extension().is_some_and(|ext| ext == "md") {
                 continue;
             }
 
@@ -344,7 +344,7 @@ impl SteeringDocuments {
             };
             let path = entry.path();
 
-            if !path.extension().map_or(false, |ext| ext == "md") {
+            if !path.extension().is_some_and(|ext| ext == "md") {
                 continue;
             }
 

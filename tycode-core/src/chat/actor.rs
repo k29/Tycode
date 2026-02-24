@@ -37,6 +37,7 @@ use crate::{
         review::ReviewModule,
         task_list::TaskListModule,
     },
+    plugin::{HookEvent, HookInput, PluginManager},
     settings::{ProviderConfig, Settings, SettingsManager},
     skills::SkillsModule,
     spawn::SpawnModule,
@@ -54,7 +55,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimingState {
@@ -117,6 +118,7 @@ pub struct ChatActorBuilder {
     modules: Vec<Arc<dyn Module>>,
     settings_manager: Option<SettingsManager>,
     shared_provider: SharedProvider,
+    skills_module: Option<Arc<SkillsModule>>,
 }
 
 impl ChatActorBuilder {
@@ -185,6 +187,7 @@ impl ChatActorBuilder {
             modules: Vec::new(),
             settings_manager: Some(settings_manager.clone()),
             shared_provider: shared_provider.clone(),
+            skills_module: None,
         };
 
         builder.with_module(read_only_file_module);
@@ -209,7 +212,8 @@ impl ChatActorBuilder {
             &home_dir,
             &settings.skills,
         ));
-        builder.with_module(skills_module);
+        builder.with_module(skills_module.clone());
+        builder.skills_module = Some(skills_module);
 
         builder.with_module(Arc::new(ReviewModule));
 
@@ -264,6 +268,7 @@ impl ChatActorBuilder {
                 MockBehavior::Success,
             ))
                 as Arc<dyn AiProvider>)),
+            skills_module: None,
         };
 
         builder.with_module(task_list_module);
@@ -326,6 +331,7 @@ impl ChatActorBuilder {
         let modules = self.modules;
         let settings_manager = self.settings_manager;
         let shared_provider = self.shared_provider;
+        let skills_module = self.skills_module;
 
         tokio::task::spawn_local(async move {
             let actor_state = ActorState::new(
@@ -342,6 +348,7 @@ impl ChatActorBuilder {
                 provider_override,
                 settings_manager,
                 shared_provider,
+                skills_module,
             )
             .await;
 
@@ -484,6 +491,8 @@ pub struct ActorState {
     pub prompt_builder: PromptBuilder,
     pub context_builder: ContextBuilder,
     pub modules: Vec<Arc<dyn Module>>,
+    pub plugin_manager: PluginManager,
+    pub skills_module: Option<Arc<SkillsModule>>,
 }
 
 impl ActorState {
@@ -549,6 +558,7 @@ impl ActorState {
         provider_override: Option<Arc<dyn AiProvider>>,
         settings_manager: Option<SettingsManager>,
         shared_provider: SharedProvider,
+        skills_module: Option<Arc<SkillsModule>>,
     ) -> Self {
         let settings = settings_manager.unwrap_or_else(|| {
             SettingsManager::from_settings_dir(root_dir.clone(), profile.as_deref())
@@ -594,6 +604,36 @@ impl ActorState {
         modules.push(mcp_module.clone());
 
         let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+
+        // Initialize plugin manager
+        let plugin_manager = PluginManager::new(
+            &workspace_roots,
+            &home_dir,
+            &settings_snapshot.plugins,
+        );
+
+        // Add plugin skills to the skills manager
+        if let Some(ref sm) = skills_module {
+            let plugin_skill_dirs = plugin_manager.get_all_skill_dirs();
+            if !plugin_skill_dirs.is_empty() {
+                sm.manager().add_plugin_skill_dirs(&plugin_skill_dirs);
+            }
+        }
+
+        // Add MCP servers from plugins
+        {
+            let plugin_mcp_servers = plugin_manager.get_all_mcp_servers();
+            if !plugin_mcp_servers.is_empty() {
+                for (name, config) in plugin_mcp_servers {
+                    if let Err(e) = mcp_module.add_server(name.clone(), config).await {
+                        warn!("Failed to add plugin MCP server '{}': {}", name, e);
+                    } else {
+                        debug!("Added plugin MCP server '{}'", name);
+                    }
+                }
+            }
+        }
+
         let steering = SteeringDocuments::new(
             workspace_roots.clone(),
             home_dir,
@@ -655,6 +695,8 @@ impl ActorState {
             prompt_builder,
             context_builder,
             modules,
+            plugin_manager,
+            skills_module,
         }
     }
 
@@ -685,7 +727,7 @@ impl ActorState {
         }
 
         if matches!(new_state, TimingState::WaitingForHuman) {
-            let message = std::mem::replace(&mut self.timing_stats.message, TimingStat::default());
+            let message = std::mem::take(&mut self.timing_stats.message);
             self.timing_stats.session += message;
         }
 
@@ -954,8 +996,73 @@ async fn handle_user_input(
     }
 
     // Generate session ID on first user message
-    if state.session_id.is_none() {
+    let is_new_session = state.session_id.is_none();
+    if is_new_session {
         state.session_id = Some(ActorState::generate_session_id());
+
+        // Dispatch SessionStart hook
+        if state.plugin_manager.has_hooks(HookEvent::SessionStart) {
+            let cwd = state
+                .workspace_roots
+                .first()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| ".".to_string());
+            // Sessions are stored as <session_id>.json files
+            let transcript_path = state
+                .sessions_dir
+                .join(format!("{}.json", state.session_id.as_ref().unwrap()))
+                .display()
+                .to_string();
+
+            let hook_input = HookInput::session_start(
+                state.session_id.as_ref().unwrap(),
+                &cwd,
+                &transcript_path,
+            );
+
+            let _ = state
+                .plugin_manager
+                .dispatch_hook(HookEvent::SessionStart, hook_input)
+                .await;
+        }
+    }
+
+    // Dispatch UserPromptSubmit hook
+    if state.plugin_manager.has_hooks(HookEvent::UserPromptSubmit) {
+        let session_id = state.session_id.as_deref().unwrap_or("unknown");
+        let cwd = state
+            .workspace_roots
+            .first()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        // Sessions are stored as <session_id>.json files
+        let transcript_path = state
+            .sessions_dir
+            .join(format!("{}.json", session_id))
+            .display()
+            .to_string();
+
+        let hook_input = HookInput::user_prompt_submit(session_id, &cwd, &transcript_path, &input);
+
+        match state
+            .plugin_manager
+            .dispatch_hook(HookEvent::UserPromptSubmit, hook_input)
+            .await
+        {
+            crate::plugin::HookResult::Blocked(reason) => {
+                state
+                    .event_sender
+                    .send_message(ChatMessage::error(format!("Blocked by hook: {}", reason)));
+                return Ok(());
+            }
+            crate::plugin::HookResult::Denied(reason) => {
+                state
+                    .event_sender
+                    .send_message(ChatMessage::warning(format!("Denied by hook: {}", reason)));
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 
     if images.is_empty() {
